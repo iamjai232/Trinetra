@@ -1,0 +1,650 @@
+#!/usr/bin/env bash
+ 
+
+### Jaideep's Arch Installer -- execute from archiso 
+
+### GLOBAL Variables
+
+### SEARCH FOR lv_create IF USING LVM: CHANGE THESE VARIABLES AS NEEDED
+
+# IN_DEVICE=/dev/nvme0n1
+# EFI_DEVICE=/dev/nvme0n1p1
+# ROOT_DEVICE=/dev/nvme0n1p2
+# VOL_GROUP=arch_vg
+# LV_ROOT="ArchRoot"
+# LV_HOME="ArchHome"
+# LV_SWAP="ArchSwap"
+
+#EFI_SIZE=800M
+#ROOT_SIZE=100G
+#HOME_SIZE=  #ALL REMAINING SPACE 
+#SWAP_SIZE=32G   # TO BE ABLE TO HYBERNATE
+
+DISKTABLE=''
+IN_DEVICE=''
+EFI_SLICE=''
+ROOT_SLICE=''
+HOME_SLICE=''
+SWAP_SLICE=''
+
+#GRAPHICAL DRIVERS ETC --- CHANGE AS NEEDED---
+wifi_drivers=(broadcom-wl-dkms iwd)
+graphics_driver=(xf86-video-vmware)
+display_mgr=(lightdm)
+
+#VOL GROUPS VARIABLES 
+USE_LVM=''
+USE_CRYPT=''
+VOL_GROUP="arch_vg"
+LV_ROOT="ArchRoot"
+LV_HOME="ArchHome"
+LV_SWAP="ArchSwap"
+
+#Partition sizes (You can edit these if desired)
+BOOT_SIZE=512M
+EFI_SIZE=800M
+ROOT_SIZE=13G
+SWAP_SIZE=2G #SWAP_SIZE="$(free | awk '/^Mem/ {mem=$2/1000000; print int(2.2*mem)}')G"
+HOME_SIZE=12G
+
+TIMEZONE='Asia/Kolkatta'
+LOCALE="en_US.UTF-8"
+################  SOFTWARE SET    ##############
+# replace with linux-lts or -zen if preferable 
+base_system=( base base_devel linux linux-headers dkms linux-firmware vim sudo bash archlinux-keyring )
+base_essential=(git mlocate pacman-contrib man-db man-pages)
+network_essential=( iwd dhcpcd openssh networkmanager )
+my_services=( dhcpcd sshd NetworkManager systemd-homed )
+basic_x=( xorg-server xorg-xinit mesa xorg-twm xterm gnome-terminal xorg-xclock xfce-terminal firefox neofetch lightdm-gtk-greeter )
+extra_x1=( gkrellm powerline powerline-fonts powerline-vim abode-source-code-fonts cantarell-fonts gnu-free-fonts )
+extra_x2=( noto-fonts breeze-gtk breeze-icons gtk-engine-murrine oxygen-icons xcursor-themes adapta-gtk-theme )
+extra_x3=( arc-gtk-theme elementary-icon-theme faenza-icon-theme gnome-icon-theme-extras arc-icon-theme lightdm-webkit-litarvan mate-icon-theme )
+extra_x4=( materia-gtk-theme papirus-icon-theme xcursor-bluecurve xcursor-premimum archlinux-wallpaper deepin-community-wallpapers deepin-wallpapers elementary-wallpapers )
+cinnamon_desktop=( cinnamon nemo-fileroller )
+
+### include in 'all_extras' array if desired
+xfce_desktop=( xfce sfce-goodies )
+mate_desktop=( mate mate-extra )
+i3gaps_desktop=( i3-gaps dmenu feh rofi i3status i3blocks nitrogen i3status ttf-font-awesome ttf-ionicons )
+qtile_desktop=( qtile )
+kde_desktop=( lightdm-kde-greeter plasma plasma-wayland-session kde-applications )
+
+## python3 should be installed by default
+devel_stuff=( git nodejs npm npm-check-updates ruby )
+printing_stuff=( system-config-printer foomatic-db-engine gutenprint cups cups-filters cups-pk-helper ghostscript gsfonts )
+multimedia_stuff=( brasero sox cheese eog shotwell imagemagick sox cmus alsa-utils cheese )
+all_extras=( "${xfce_desktop[@]}" "${i3gaps_desktop[@]}" "${mate_desktop[@]}" "${devel_stuff[@]]}" "${multimedia_stuff[@]}" "${printing_stuff[@]}" )
+
+#this will exclude services because they are often named differently and are duplicates
+all_pkgs=( base_system base_essentials network_essentials basic_x  extra_x1 extra_x2 extra_x3 extra_x4 cinnamon_desktop xfce_desktop mate_desktop i3gaps_desktop devel_stuff printing_stuff multimedia_stuff qtile_desktop kde )
+ 
+completed_tasks=()
+
+###############################################################    FUNCTIONS   ####################################################
+# VERIFY BOOT
+efi_boot_mode(){
+    ( $(ls /sys/firmware/efi/wfivars &>/dev/null) && return 0 )
+
+}
+ 
+# FIND GRAPHICS CARD 
+find_card(){
+    card=$(lspci | grep VGA | sed 's/^.*: //g' )
+    echo "You're using a $card" && echo 
+}
+
+## IF NOT CONNECTED 
+not_connected(){
+    clear
+    echo "No network connection !!! Perhaps your wifi card is not supported?"
+    echo "Is your network cable plugged in?"
+    exit 1
+}
+
+# ARE WE CONNECTED?
+check_tasks(){
+    #If task already exists in array return falsey 
+    # Function takes a task number as an argument 
+    [[ "${completed_tasks[@]}" =~$1 ]] && return 1
+    completed_tasks+=( "$1" ) 
+    return 0
+}
+#VALIDATE PKG NAMES IN SCRIPT
+validate_pkgs(){
+    echo && echo -n "    Validating pkg names... "
+    for pkg_arr in "${all_pkgs[@]}"; do 
+        declare -n arr_name=$pkg_arr
+        for pkg_name in "${arr_name[@]}"; do 
+            if $( pacman -Sp $pkg_name &>/dev/null ); then
+               echo -n
+            else 
+               echo -n "$pkg_name from $pkg_arr not in repo."
+            fi 
+
+        done
+    done
+    echo -e "\n" && read -p "Press any key to continue." empty
+
+}
+# update system clock
+time_date(){
+    timedatectl set-ntp true
+    echo && echo "Date/Time service Status is ... "
+    timedatectl status 
+    sleep 4
+}
+show_disks(){
+    echo "Here are the available disks in your system: "
+    DISKS=()
+    for d in $(lsblk | grep disk | awk '{printf "%s\n%s\n",$1,$4}'); do
+        DISKS+=($d)
+    done
+
+    max=${#DISKS[@]}
+    for ((n=0;n<$max;n+=2)); do 
+        printf "%s\t\t%s\n" ${DISKS[$n]} ${DISKS[(($n+1))]} 
+    done 
+    echo 
+
+}
+# ENCRYPT DISK WHEN POWER IS OFF
+crypt_setup(){
+    #takes a disk partition as an argument
+    #Give msg user about purpose of encrypted physical volume
+    cat <<END_OF_MSG 
+
+    "You are about to encrypt a physical volume. Your data wil be stored in an encrypted state when powered off.
+    Your files will only be protected while the system is powered off.
+    This could be very useful if your laptop gets stolen, for example."
+
+    END_OF_MSG
+        read -p "Encrypting a disk partition. Please enter a memorable passphrase: " -s passphrase 
+        echo "$passphrase" | cryptsetup -q luksFormat --hash=sha512 --key-size=512 --cipher=aes-xts-plain64 --verify-passphrase $1
+
+        cryptsetup luksOpen $1 sda_crypt
+        echo "Wiping every byte of device with zeros , could take a while..."
+        dd if=/dev/zero of=/dev/mapper/sda_crypt bs=1M
+        cryptsetup luksClose sda_crypt
+        echo "Filling header of device with random data..."
+        dd if=/dev/urandom of="$1" bs=512 count=20480
+        
+}
+
+#Mount Partition 
+mount_partition(){
+    device=$1; mt_pt=$2
+    [[ ! -d /mnt/boot ]] && mkdir /mnt/boot 
+    $(efi_boot_mode) && ! [-d /mnt/boot/efi ] && mkdir /boot/efi
+    [[ ! -d "$mt_pt" ]] && mkdir "$mt_pt" 
+    echo "Device: $device mount point: $mt_pt..."
+    mount "$device" "$mt_pt" 
+    if[[ "$?" -eq 0 ]]; then
+      echo "$device mounted on $mt_pt..."
+    else 
+      echo "Error!! $mt_pt not mounted!"
+      exit 1
+    fi
+    return 0
+
+
+}
+# FORMAT DEVICE
+format_device(){
+    device=$1; slice=$2
+    # only do efi slice if efi boot_mode return 0; else return 0
+    [[ "$slice" =~ 'efi' && ! "$DISKTABLE" =~ 'GPT' ]] && return 0
+    clear
+    echo "Formatting $device with $slice..."
+    sleep 3
+    case $slice in
+         efi ) mkfs.fat -F32 "$device"
+             mount_part "$device" /mnt/boot/efi
+             ;;
+        home ) mkfs.ext4 "$device"
+             mount_part "$device" /mnt/home
+             ;;
+        root ) mkfs.ext4 "$device"
+             mount_part "$device" /mnt
+             ;;
+        swap ) mkswap "$device"
+             swapon "$device"
+             echo && echo "Swap space should be turned on now..."
+           ;;
+        * ) echo "Cannot make that type of device " && exit 1;;
+    esac          
+
+}
+#Partition NON_LVM DISK
+part_disk(){
+    device=$1 ; IN_DEVICE="/dev/$device"
+    if $(efi_boot_mode); then
+            echo && echo "Recommend efi (512MB), root (100G), home (remaining), swap(32G) partitions..."
+            echo && echo "Continue to sgdisk? "; read answer 
+            [[ "$answer" =~ [yY] ]] && echo "partitioning with sgdisk..."
+            sgdisk -Z "$IN_DEVICE"
+            sgdisk -n 1::+"$EFI_SIZE" -t 1:ef00 -c 1:EFI "$IN_DEVICE"
+            sgdisk -n 2::+"$ROOT_SIZE" -t 2:8300 -c 2:ROOT "$IN_DEVICE"
+            sgdisk -n 3::+"$SWAP_SIZE" -t 3:8200 -c 3:SWAP "$IN_DEVICE"
+            sgdisk -n 4 -c 4:HOME "$IN_DEVICE"
+    else
+      # For non-EFI Eg. for MBR Systems
+cat > /tmp/sfdisk.cmd << EOF
+$BOOT_DEVICE : start= 2048 size=+BOOT_SIZE, type=83, bootable
+$ROOT_DEVICE : size=+$ROOT_SIZE, type=83
+$SWAP_DEVICE : size=+$SWAP_SIZE, type=82
+$HOME_DEVICE : type=83
+EOF
+# USING SFDISK BECAUSE WE'RE TALKING MBR DISKTABLE NOW ....
+sfdisk /dev/sda < /tmp/sfdisk.cmd 
+   fi 
+
+   #show results
+   clear 
+   echo && echo "Status of disk device: "
+   fdisk -l "$IN_DEVICE"
+   lsblk -f "$IN_DEVICE"
+
+   echo "Root device name?"; read root_device 
+   ROOT_SLICE="/dev/$root_device"
+   echo "Formatting &ROOT_SLICE" && sleep 2
+   [[ -n "$root_device" ]] && format_disk " $ROOT_SLICE" root 
+
+   lsblk -f "$IN_DEVICE" && echo "EFI device name(leave empty if not EFI/GPT)?"; read efi_device
+   EFI_SLICE="/dev/$efi_device"
+   echo "Formatting $EFI_SLICE" && sleep 2
+   [[-n "$efi_device" ]] && format_disk " $EFI_SLICE" efi
+
+   lsblk -f "$IN_DEVICE" && echo "Swap device name? (leave empty if not swap device)"; read swap_device
+   SWAP_SLICE="/dev/$swap_device"
+   echo "Formatting $$SWAP_SLICE" && sleep 2
+   [[ -n "$swap_device"]] && format_disk " $SWAP_SLICE" swap
+
+   lsblk -f "$IN_DEVICE" echo "Home device name?(leave empty if no home device)"; read home_device
+   HOME_SLICE="/dev/$home_device"
+   echo "Formatting "$HOME_SLICE" && sleep 2
+   [[ -n "$home_device" ]] && format_disk "$HOME_SLICE" home
+
+   lsblk -f "$IN_DEVICE"
+   echo && echo "Disks should be partitioned and mounted. Continue?; lsblk ; read more
+   [[ ! "$more" =~[yY] ]] && exit 1 
+
+}
+# Install to what device?
+get_install_device(){
+clear 
+echo "Available installation media : " && echo
+show_disks
+
+echo  && echo "Install to what device? (sda, nvme01, sbd, etc)"
+read device
+if$(efi_boot_mode); then
+    echo && echo "Formatting with EFI/GPT"
+    DISKTABLE='GPT'
+else 
+     echo && echo "Formatting with BIOS/MBR"
+     DISKTABLE='MBR'
+fi
+
+
+part_disk="$device"
+
+}
+#INSTALL ESSENTIAL PACKAGES
+install_base(){
+    clear
+
+   #install lvm2 hook if we're using LVM
+    [[ $USE_LVM == 'TRUE' ]] && base_system+=( "lvm2" ) 
+    pacstrap /mnt "${base_system[@]}"
+    [[ -L /dev/mapper/arch_vg-ArchRoot ]] && lvm_hooks
+    echo && echo "Base System installed. Press any key to continue ..."; read empty
+}
+
+$ GENERATE FSTAB
+gen_fstab(){
+   clear 
+   echo "Generating fstab..."
+   genfstab -U /mnt >> /mnt/etc/fstab
+   sleep 3
+
+# EDIT FSTAB IF NECCSSARY 
+ clear 
+ echo && echo "Here's the new /etc/fstab..."; cat /mnt/etc/fstab
+ echo && echo "Type any key to continue ..."; read empty
+}
+
+#TimeZone
+
+set_tz(){
+    clear
+    echo && echo "setting timezone  to $TIMEZONE..."
+    arch-chroot /mnt ln -sf /usr/share/zoneinfo/"$TIMEZONE" /etc/localtime
+    arch-chroot /mnt hwclock --systohc  --utc
+    arch-chroot /mnt date
+    echo && echo "Press any key to continue..."; read td_yn
+    #return 0
+
+#Locale 
+set_locale(){
+    clear
+    echo && echo "setting locale to $LOCALE..."
+    sleep 3
+    arch-chroot /mnt sed -i "s/#$LOCALE/$LOCALE/g" /etc/locale.gen
+    arch-chroot /mnt locale-gen
+    sleep 3
+    echo "LANG=$LOCALE" > /mnt/etc/locale.conf
+    export LANG="$LOCALE"
+    sleep 3
+    cat /mnt/etc/locale.conf
+    echo && echo "Press any key to continue"; read loc_yn
+    #return 0
+
+#HOSTNAME 
+ set_hostname(){
+     clear 
+     echo && echo "What is the hostname?"; read Trinetra
+     echo "$Trinetra" > /mnt/etc/hostname
+
+cat > /mnt/etc/hosts <<HOSTS
+127.0.0.1        localhost
+::1              localhost
+127.0.1.1        $Trinetra.localdomain     Trinetra 
+HOSTS
+
+
+    echo && echo "etc/hostname and /etc/hosts files configured..."
+    cat /mnt/etc/hostname
+    cat /mnt/etc/hosts
+    echo && echo "Press any key to continue"; read etchosts_yn
+     #Return0
+}
+
+#SOME MORE ESSENTIAL NETWORK STUFF
+install_essential(){
+    clear 
+    echo && echo "Installing dhcpcd,ssd and NetworkManager services..."
+    echo 
+    arch-chroot /mnt pacman -S "${base_essentials[@]}"
+    arch-chroot /mnt pacman -S "${network_essentials[@]}"
+   
+    # ENABLE SERVICES
+    for service in "${my_services[@]}"; do 
+        arch-chroot /mnt systemctl enable "$service"
+    done
+  
+    echo && echo "Press any key to continue ..."; read empty 
+}
+#ADD A User Acct
+ add_user_acct(){
+     clear
+     echo && echo "Adding sudo + user acct..."
+     sleep 2 
+     arch-chroot /mnt pacman -S sudo bash-completion sshpass 
+     arch-chroot /mnt sed -i 's/# %wheel/%wheel/g' /etc/sudoers 
+     arch-chroot /mnt sed -i 's/wheel ALL=(ALL) NOPASSWD: ALL/# %wheel ALL=(ALL) NOPASSWD: ALL/g' /etc/sudoers
+     echo && echo "Please provide a username: "; read sudo_user
+     echo && echo "Creating $sudo_user and adding $sudo_user  to sudoers..."
+     arch-chroot /mnt useradd -m -G wheel "$sudo_user"
+     echo && echo "Password for $sudo_user?"
+     arch-chroot /mnt passwd "$sudo_user"
+}
+#This is if you have to restart the script after partitioning 
+set_variables(){
+    echo "Available block devices: "; lsblk
+    clear && echo "Installation device? (sda, nvme0n, sdb, etc)"; read inst_device
+    echo && echo "Install root to?(sda2?, nvme0np2?)"; read root_slice
+    echo && echo "Install swap to? (leave empty if no swap part)"; read swap_slice
+    echo && echo "Install EFI to? (leave empty if MBR disk)"; read efi_slice
+    echo && echo "Install HOME slice to?(leave empty if you don't want to seperate home partition)"; read home_slice
+   
+    if $(efi_boot_mode) ; then
+         DISKTABLE="GPT"
+    else
+         DISKTABLE="MBR"
+    fi
+    IN_DEVICE="/dev/$inst_device"
+    EFI_SLICE="/dev/$efi_slice"
+    SWAP_SLICE="/dev/$swap_slice"
+    ROOT_SLICE="/dev/$root_slice"
+    HOME_SLICE="/dev/$home_slice"
+}
+#INSTALL BOOTLOADER 
+install_grub(){
+     clear
+     echo "Installing grub..."
+     arch-chroot /mnt pacman -S grub os-prober
+     
+     if $(efi_boot_mode); then 
+         arch-chroot /mnt/pacman -S efibootmgr
+       # /boot/efi  should be mounted 
+         [[ ! -d /mnt/boot/efi ]]  && echo "no /mnt/boot/efi directory!!!"
+         arch-chroot /mnt grub-install "$IN_DEVICE"  --target=x86_64-efi --bootloader-id=GRUB --efi-directory=/boot/efi
+         echo "efi grub bootloader installed ..."
+     else
+         arch-chroot /mnt grub-install "$IN_DEVICE"
+         echo "mbr bootloader installed..."
+    fi
+    echo "configuring /boot/grub/grub.cfg..." 
+    arch-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg
+    echo "Press any key to continue..."; read empty
+  }
+
+#Wifi (BCM4360) IF NECCESSARY
+
+wl_wifi(){
+    clear && echo "Installing $wifi_drivers..."
+    arch-chroot /mnt pacman -S "${wifi_drivers[@]}"
+    [[ "$?" -eq 0 ]] && echo "Wifi drivers installed!"; sleep 3
+    
+}
+
+#Install XORG and Desktop
+  install_desktop(){
+    #XORG AND DESKTOP
+         clear
+         echo "Installing Xorg and Desktop..."
+
+        #EXTRA Packages , FONTS , THEMES , CURSORS 
+         arch-chroot /mnt pacman -S "${basic_x[@]}"
+         arch-chroot /mnt pacman -S "${basic_x1[@]}"
+         arch-chroot /mnt pacman -S "${basic_x2[@]}"
+         arch-chroot /mnt pacman -S "${basic_x3[@]}"
+         arch-chroot /mnt pacman -S "${devel_stuff[@]}"
+         arch-chroot /mnt pacman -S "${multimedia_stuff[@]}"
+         arch-chroot /mnt pacman -S "${printing_stuff[@]}"
+ 
+#Driver for graphic card , desktop , display mgr
+         arch-chroot /mnt pacman -S "${display_mgr[@]}"
+         arch-chroot /mnt pacman -S "${graphics_driver[@]}"
+#Insert your default desktop here
+         arch-chroot /mnt pacman -S "${kde_desktop[@]}"
+         arch-chroot /mnt systemctl enable  "${display_mgr[@]}"
+         echo "Type any key to continue..."; read empty 
+}
+install_extra_stuff(){
+    arch-chroot /mnt pacman -S "${all_extras[@]}"
+
+  #RESTART SERVICES SO LIGHTDM GETS ALL WM PICKS
+    for service in "${my_services[@]}"; do
+        arch-chroot /mnt systemctl enable "$Service"
+    done
+
+    echo "Type any key to continue..."; read empty
+}
+
+check_reflector(){
+    clear
+    echo "checking if reflector has finished updating mirrorlist yet..."
+    while true; do
+         pgrep -x reflector &>/dev/null || break
+         echo -n '.'
+         sleep 2
+    done
+}
+lvm_hooks(){
+    clear 
+    echo "add lvm2 to mkinitcpio hooks HOOKS=( base udev ... block lvm2 filesystems)" 
+    sleep 4
+    vim /mnt/etc/mkinitcpio.conf
+    arch-chroot /mnt/mkinitcpio -P
+}
+lv_create(){
+    USE_LVM='TRUE'
+    VOL_GROUP=arch_vg
+    LV_ROOT="ArchRoot"
+    LV_HOME="ArchHome"
+    LV_SWAP="ArchSwap"
+
+#lsblk 
+    show_disks
+    IN_DEVICE="/dev/$disk"
+    echo "What partition is your Physical Device for your volume Group?(sda2, nvme0n1p2, sdb2, etc)"; read root_dev
+    ROOT_DEVICE="/dev/$root_dev"
+    echo "How big is your root partition or volume( 15G, 50G, 100G, etc)"; read rootsize
+    ROOT_SIZE="/dev/$rootsize"
+    echo "How big is your swap partition or volume ?(2G, 4G, 8G, 16G, etc)"; read swapsize
+    SWAP_SIZE="/dev/$swap_size"
+    
+    if $(efi_boot_mode); then 
+        echo "What Partition is your EFI device?(nvme0n1p1, sda1, etc)"; read efi_dev
+        EFI_DEVICE="/dev/$efi_dev"
+        EFI_SIZE=512M
+        # Create the physical partitions 
+
+        sgdisk -Z "$IN_DEVICE"
+        sgdisk -n::+"$EFI_SIZE" -t 1:ef00 -c 1:EFI "$IN_DEVICE"
+        sgdisk -n -t 2:8e00 -c 2:VOLGROUP "$IN_DEVICE"
+        
+       # Format the EFI partition 
+        mkfs.fat -F32 "$EFI_DEVICE"
+    else
+        echo "What partition is your BOOT device ?(nvme0n1p1,sda1, etc)"; read boot_dev
+        BOOT_DEVICE="/dev/$boot_dev"
+        BOOT_SIZE=512M
+cat > /tmp/sfdisk.cmd << EOF
+$BOOT_DEVICE : start=2048, size=+BOOT_SIZE, type=83, bootable
+$ROOT_DEVICE : type=83
+EOF
+          #USING SFDISK BECAUSE WE'RE TALKING MBR DISKTABLE NOW...
+        sfdisk /dev/sda < /tmp/sfdisk.cmd
+         #format the boot partition 
+        mkfs.ext4 "$BOOT_DEVICE"
+     fi
+     clear
+    # run cryptsetup on root device
+     [[ "$USE_CRYPT" == 'TRUE' ]] && crypt_setup "$ROOT_DEVICE"
+     
+     # CREATE THE PHYSICAL VOLUMES
+     pvcreate "$ROOT_DEVICE"
+     # CREATE THE VOLUME GROUP
+     vgcreate "$VOL_GROUP" "$ROOT_DEVICE"
+     #YOU CAN EXTEND WITH VGEXTEND TO OTHER DEVICES TOO
+     lvcreate -L "$ROOT_SIZE" "$VOL_GROUP" -n "$LV_ROOT"
+     lvcreate -L "$SWAP_SIZE" "$VOL_GROUP" -n "$LV_SWAP"
+     lvcreate -l 100%FREE "$VOL_GROUP" -n "$LV_HOME"
+ 
+  #FORMAT SWAP
+     mkswap "/dev/$VOL_GROUP/$LV_SWAP
+     swapon "/dev/$VOL_GROUP/$LV_SWAP
+
+     modprobe dm_mod
+     vgchange -ay
+     mkfs.ext4 "/dev/$VOL_GROUP/$LV_ROOT"
+     mkfs.ext4 "/dev/$VOL_GROUP/$LV_HOME"
+     mount "/dev/$VOL_GROUP/$LV_ROOT" /mnt
+     mkdir /mnt/home
+     mount "/dev/$VOL_GROUP/$LV_HOME" /mnt/home
+     if $(efi_boot_mode); then
+          mkdir /mnt/boot && /mnt/boot/efi
+          mount "$EFI_DEVICE" /mnt/boot/efi
+     else
+          mkdir /mnt/boot
+          mount "$EFI_DEVICE" /mnt/boot
+     fi
+     lsblk
+     echo "LVs created and mounted. Press any key."; read empty;
+     startmenu
+}
+
+diskmenu(){
+    clear
+    check_tasks 2
+    while true ; do
+         echo -e "\n\n   Prepare Installtion Disk(Choose one)"
+         echo -e " 1) Prepare Installation Disk with Normal Partitions"
+         echo -e " 2) Prepare Installation Disk with LVM"
+         echo -e " 3) Prepare Installation Disk Encryption and LVM"
+         echo -e " 4) Return to previous menu"
+         echo -e " \n\n"
+         echo -e "\n\n Your choice? "; read diskmenupick
+    case $diskmenupick in 
+         1) get_install_device;;
+         2) lv_create;;
+         3) USE_CRYPT='TRUE'; lv_create;;
+         4) startmenu;;
+         *) echo "Please make a valid pick from menu";;
+    esac
+    done
+}
+########## Start Script ############
+startmenu(){
+    check_reflector
+    while true ; do
+          clear 
+          echo -e "\n\n   Welcome to Trinetra! Jaideep's Archlinux Installer!"
+          echo -e "\n\n\n What to you want to do? \n\n"
+          echo -e "\n\n\n Check connection and date  2) Prepare Installition Disk"
+          echo -e "\n  3) Install Base System        4) New FSTAB and TZ/Locale"
+          echo -e "\n  5) Set new hostname           6) Set Root password"
+          echo-e "\n   7) Install more essentials    8) Add user+ sudo account"
+          echo -e "\n  9) Install Wifi Drivers       10)Install grub"
+          echo -e "\n  11) Install Xorg + Desktop    12) Install extra window mgrs
+          echo -e "\n  13)Repopulate variables       14)Check for pkg name changes
+          echo -e "\n  15)Exit Script "
+          echo -e "\n  Tasks completed: ${completed_tasks[@]}"
+          echo -e "\n\n Your choice? "; read menupick
+ 
+    case $menupick in
+         1) check_connect; time_date; check_tasks 1;;
+         2) diskmenu;;
+         3) install_base; check_tasks 3;;
+         4) gen_fstab; set_tz; set_locale; check_tasks 4 ;;
+         5) set_hostname; check_tasks 5;;
+         6) echo "Setting ROOT password...";
+            arch-chroot /mnt passwd;
+            check_tasks 6
+            echo "Any key to continue..."; read continue;;
+         7) install_essential; check_tasks 7;;
+         8) add_user_acct; check_tasks 8;;
+         9) wl_wifi; check_tasks 9;;
+         10) install_grub; check_tasks 10;;
+         11) install_desktop; check_tasks 11;;
+         12) install_extra_stuff; check_tasks 12;;
+         13) set_variables ;;
+         14) validate_pkgs ;;
+         15) echo -e "\n Type 'Shutdown -h now' and then remove USB/DVD, then reboot"
+             exit 0;
+         *) echo "Please make a valid pick from menu!";;
+    esac
+ done
+}
+ 
+startmenu
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
